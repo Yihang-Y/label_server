@@ -1,0 +1,3 @@
+[submodule "chainlit"]
+	path = chainlit
+	url = https://github.com/Yihang-Y/chainlit
