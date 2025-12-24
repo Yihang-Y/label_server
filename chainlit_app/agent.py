@@ -4,8 +4,8 @@ import chainlit as cl
 from chainlit.context import context  
 
 from config import MCP_TOOL_TIMEOUT
-from llm_stream import stream_and_collect
-from typing import Any, Mapping, Optional
+from llm_stream import stream_and_yield_events, summarize_reasoning, request
+from typing import Any, Mapping, Optional, Dict
 from db_utils import get_openai_history
 
 def _extract_tool_call(step_input_raw: Any) -> tuple[str, dict]:
@@ -30,87 +30,157 @@ def _extract_tool_call(step_input_raw: Any) -> tuple[str, dict]:
 
     return func_name, args
 
-# def to_openai_messages(history):
-#     return list(history)
 
 async def ask_user():
-    action = await cl.AskActionMessage(
-            content=f"Continue ?",
-            actions=[
-                cl.Action(
-                    name="continue",
-                    payload={"value": "continue"},
-                    label="Continue",
-                ),
-            ],
-        ).send()
+    print("Asking user to continue...")
+    try:
+        action = await cl.AskActionMessage(
+                content=f"Continue ?",
+                actions=[
+                    cl.Action(
+                        name="continue",
+                        payload={"value": "continue"},
+                        label="Continue",
+                    ),
+                ],
+            ).send()
+        print(f"User action: {action}")
+    except Exception as e:
+        print(f"User action failed: {e}")
+        return
 
 
-@cl.step(type="tool", name="tool_request")
 async def tool_request(query: dict) -> str:
-    step = cl.context.current_step
     func_name = query.get("name", "unknown")
     args = query.get("arguments", {})
+    parent_step_id = query.get("parent_step_id")
 
-    step.name = f"🛠 {func_name}"
-    print("setting step parent id:", query.get("message_id"), "for step id:", step.id)
-    if query.get("message_id"):
-        step.parent_id = query["message_id"]
-    await step.update()
-    
+    step = cl.Step(name=f"🛠 {func_name}", type="tool")
+    if parent_step_id:
+        step.parent_id = parent_step_id
+
+    step.input = {
+        "name": func_name,
+        "arguments": args,
+    }
+    await step.send()
 
     ts = cl.user_session.get("mcp_session")
     if not ts:
-        return "MCP session not initialized."
+        step.output = "MCP session not initialized."
+        await step.update()
+        return step.output
 
     try:
-        result = await asyncio.wait_for(ts.session.call_tool(func_name, args), timeout=MCP_TOOL_TIMEOUT)
+        result = await asyncio.wait_for(
+            ts.session.call_tool(func_name, args),
+            timeout=MCP_TOOL_TIMEOUT
+        )
+        step.output = str(result)
+        await step.update()
+        return step.output
+
     except asyncio.TimeoutError:
-        return "MCP tool call timed out."
+        step.output = "MCP tool call timed out."
+        await step.update()
+        return step.output
+
     except Exception as e:
-        return f"MCP tool call failed: {e}"
+        step.output = f"MCP tool call failed: {e}"
+        await step.update()
+        return step.output
 
-    return str(result)
 
-async def run_agent_turn(client, available_tools, last_message_id):
-    rounds = 0
-    await ask_user()
-    while True:
-        rounds += 1
-
-        messages = await get_openai_history(context.session.thread_id)
-        print("messages history:", messages)
-        payload = {
-            "messages": messages,
-            "temperature": 0.7,
-            "tools": available_tools,
-        }
-        
+async def run_agent_turn(client: Any, payload: Dict[str, Any]):
+    print("[INFO] Running agent turn with payload:", payload["messages"])
+    content, reasoning, tool_calls = await request(client, payload)
+    
+    if content == "" and reasoning == "" and not tool_calls:
+        print("[WARN] Empty response from agent.")
+        return
+    else:
+        print("[INFO] content:", content)
+        print("[INFO] reasoning:", reasoning)
+        print("[INFO] tool_calls:", tool_calls)
+    
+    if reasoning:
+        print("Agent Reasoning not used:", reasoning)
+    if len(tool_calls) > 0:
+        for tc in tool_calls.values():
+            tool_request_payload = {
+                "name": tc["function"]["name"],
+                "arguments": json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {},
+            }
+            tool_result = await tool_request(tool_request_payload)
+            return
+    if content:
         msg = cl.Message(content="")
-        # TODO: add reasoning step streaming
-        # text, resoning, tool_calls_acc = await stream_and_collect(client=client, payload=payload, msg=msg)
-        text, tool_calls_acc = await stream_and_collect(client=client, payload=payload, msg=msg)
-        print("messages:", text, msg.id)
+        msg.content = content
+        await msg.send()
+    
+
+
+async def run_agent_turn_with_steps_streaming(client: Any, payload: Dict[str, Any]):
+    async with cl.Step(name="Agent Turn", type="run") as turn_step:        
+        reasoning_step = cl.Step(name="Reasoning", type="cot")
+        reasoning_step.parent_id = turn_step.id
+        await reasoning_step.send()
         
-        if text and msg:
-            last_message_id = msg.id
-        if not tool_calls_acc:
-            print("No tool calls detected, finishing agent turn.")
-            break
-        
-        await ask_user()
-        
-        for _, acc in tool_calls_acc.items():
-            raw_args = acc["function"]["arguments"]
-            try:
-                args_obj = json.loads(raw_args) if raw_args else {}
-            except Exception:
-                args_obj = {}
-            
-            res = await tool_request({"name": acc["function"]["name"], "arguments": args_obj, "message_id": last_message_id})
+        async for ev in stream_and_yield_events(client=client, payload=payload):
+            if ev["type"] == "reasoning_delta":
+                await reasoning_step.stream_token(ev["delta"])
+            elif ev["type"] == "done":
+                if ev["content"]:
+                    msg = cl.Message(content="")
+                    msg.content = ev["content"]
+                    await reasoning_step.update()
+                    await msg.send()
+                    break
+                
+                reasoning = ev.get("reasoning") or ""
+                if reasoning:
+                    print("[INFO] Final reasoning:", reasoning)
+                    reasoning_step.output = reasoning
+                    await reasoning_step.update()
+                    
+                    summary_plan = await summarize_reasoning(client=client, reasoning=reasoning)
+                    reasoning_step.input = f"{str(summary_plan)}"
+                    print("[INFO] Final summarized plan:", summary_plan)           
+                    await reasoning_step.update()
+                
+                tool_calls = ev.get("tool_calls") or {}
+                if tool_calls:
+                    for tc in tool_calls.values():
+                        tool_request_payload = {
+                            "name": tc["function"]["name"],
+                            "arguments": json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {},
+                            "parent_step_id": turn_step.id,
+                        }
+                        tool_result = await tool_request(tool_request_payload)
+                        
+
+async def run_agent_turns(client, available_tools, last_message_id):
+    rounds = 0
+    try:
+        while True:
+            rounds += 1
+
+            messages = await get_openai_history(context.session.thread_id)
+            # print("messages history:", messages)
+            payload = {
+                "messages": messages,
+                "temperature": 0.7,
+                "tools": available_tools,
+            }
+            print("running agent turn with payload")
+            await ask_user()
+            await run_agent_turn_with_steps_streaming(client, payload)
+    except asyncio.CancelledError:
+        print(f"[INFO] Agent turns cancelled after {rounds} rounds.")
+        raise
             
 
-async def run_edit_step(step_row: Mapping[str, Any]) -> None:
+async def run_edit_tool_step(step_row: Mapping[str, Any]) -> None:
     step_id = str(step_row.get("step_id"))
     step_name = step_row.get("step_name") or "tool_request"
     parent_id = step_row.get("step_parentid")
@@ -131,6 +201,7 @@ async def run_edit_step(step_row: Mapping[str, Any]) -> None:
 
     # 3) 解析 tool call
     try:
+        print("parse tool call from step input:", step_input_raw)
         func_name, args = _extract_tool_call(step_input_raw)
     except Exception as e:
         edited_step.output = f"Invalid step input, cannot parse tool call: {e}"
@@ -152,3 +223,66 @@ async def run_edit_step(step_row: Mapping[str, Any]) -> None:
 
     # 5) 更新到前端/数据层
     await edited_step.update()
+    
+    
+async def run_edit_cot_step(step_row: Mapping[str, Any], client: Any, available_tools) -> None:
+    step_id = str(step_row.get("step_id"))
+    step_name = step_row.get("step_name") or "tool_request"
+    parent_id = step_row.get("step_parentid")
+    step_input_raw = step_row.get("step_input")
+    
+    # 1) generate new Step
+    edited_step = cl.Step(id=step_id, name=str(step_name))
+    edited_step.parent_id = str(parent_id) if parent_id else None
+    edited_step.type = "cot"
+    
+    # 2) generate new summary plan
+    try:
+        reasoning = step_row.get("step_output") or ""
+        summary_plan = await summarize_reasoning(client=client, reasoning=reasoning)
+        print("[INFO] Edited summarized plan:", summary_plan)
+        edited_step.input = f"{str(summary_plan)}"
+        edited_step.output = reasoning
+    except Exception as e:
+        edited_step.output = f"Failed to summarize reasoning: {e}"
+            
+    await edited_step.update()
+
+    # 3) generate tool calls or content
+    messages = await get_openai_history(context.session.thread_id, compressed=True)
+    system_prompt = """You are an agent running inside an interactive app with editable intermediate steps.
+
+IMPORTANT CONTEXT:
+- The user has edited a previous "Reasoning / CoT" step. After this edit, any downstream steps that depended on the old CoT may be invalid.
+- You MUST treat the updated conversation history (the provided messages) as the single source of truth.
+- If tool use is available, you may call tools when it meaningfully improves correctness, completeness, or safety.
+- When you decide to call a tool, you MUST use structured tool calling (tool_calls). Do NOT describe tool calls in plain text.
+- If no tool is needed, respond with normal assistant text.
+
+GOAL:
+Given the updated history, determine the best next action:
+1) Call one tool, OR
+2) Produce a user-facing response.
+
+OUTPUT RULES:
+- If calling tools: produce only valid tool_calls and no tool-call JSON in the assistant content.
+- If not calling tools: produce only normal assistant content suitable for the end user.
+- Keep outputs concise and aligned with the user's latest intent.
+"""
+    user_prompt = f"""Based on the updated conversation history, determine the next best action.
+Here is the updated conversation history:
+{json.dumps(messages, indent=2)}
+Please either call a tool using structured tool_calls, or provide a user-facing response."""
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.7,
+        "tools": available_tools,
+    }
+    await run_agent_turn(client, payload)
+    
+    
+    
+    

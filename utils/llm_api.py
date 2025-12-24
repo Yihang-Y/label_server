@@ -40,26 +40,14 @@ class ChatModel:
         except Exception as e:
             logger.error(f"Stream completion failed: {e}")
             raise e
-
-    def list_models(self):
+        
+    async def client_completions(self, **args):
         try:
-            models = self.client.models.list()
-            return [model.id for model in models.data]
+            return await self.chat(**args)
         except Exception as e:
-            logger.error(f"Failed to list models: {e}")
-            raise e
+            logger.error(f"Client completion failed: {e}")
+            raise
 
-
-if __name__ == "__main__":
-    from dotenv import load_dotenv
-
-    load_dotenv()
-    chat_model = ChatModel(
-        model_name=os.getenv("MODEL"),
-        api_key=os.getenv("OPENAI_API_KEY"),
-        model_url=os.getenv("BASE_URL"),
-    )
-    print(chat_model.list_models())
-    print(
-        chat_model.chat_with_retry([{"role": "user", "content": "Hello, how are you?"}])
-    )
+    async def list_models(self):
+        models = await self.client.models.list()
+        return [m.id for m in models.data]
