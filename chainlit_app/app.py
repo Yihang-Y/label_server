@@ -162,3 +162,10 @@ async def on_chat_resume(thread: ThreadDict):
         type="success"  
     )
 
+@cl.on_shared_thread_view
+async def on_shared_thread_view(thread, viewer: cl.User | None):  
+    """授权查看共享线程  
+      
+    返回 True 允许查看，返回 False 拒绝访问  
+    """  
+    return True
