@@ -5,4 +5,5 @@ __pycache__
 .chainlit/
 .pnpm-store/
 .venv/
+.env    
 # all files and folders in tools/
