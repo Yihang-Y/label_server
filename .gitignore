@@ -1,0 +1,8 @@
+__pycache__
+*.pyc
+*.log
+*.egg-info
+.chainlit/
+.pnpm-store/
+.venv/
+# all files and folders in tools/
