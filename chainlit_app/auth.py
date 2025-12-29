@@ -15,6 +15,7 @@ async def oauth_callback(
 ) -> Optional[User]:
     email = (raw_user_data.get("email") or raw_user_data.get("preferred_username") or "").strip().lower()
     name = (raw_user_data.get("name") or raw_user_data.get("login") or raw_user_data.get("display_name") or "").strip()
+    print(f"[oauth] Retrieved user data: email={email}, name={name}")
 
     if not email:
         print("[oauth] No email found in user data.")
