@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
  
-async def fetch_step(thread_id: str, step_id: str):
+async def fetch_step(data_layer, thread_id: str, step_id: str):
     sql = text("""
         SELECT
             s."id"       AS step_id,
@@ -17,16 +17,71 @@ async def fetch_step(thread_id: str, step_id: str):
           AND s."id" = :step_id
         LIMIT 1
     """)
-    data_layer = SQLAlchemyDataLayer(conninfo=DB_CONNINFO)
+    # data_layer = SQLAlchemyDataLayer(conninfo=DB_CONNINFO)
 
     async with data_layer.async_session() as session:
         result = await session.execute(sql, {"thread_id": thread_id, "step_id": step_id})
         row = result.mappings().first()
         return row
-    
 
-async def get_openai_history(thread_id: str, compressed: bool = False, cot_settings: Optional[str] = None) -> List[Dict[str, str]]:
-    data_layer = SQLAlchemyDataLayer(conninfo=DB_CONNINFO)
+RUN_STEP_NAMES = {"run"}  # 按你的系统改
+
+def _is_run_step(name: str | None) -> bool:
+    if not name:
+        return False
+    return name in RUN_STEP_NAMES
+
+async def fetch_last_agent_turn(data_layer, thread_id: str):
+    sql = text("""
+        SELECT
+        s."id",
+        s."name",
+        s."parentId",
+        s."createdAt",
+        s."type"
+        FROM steps s
+        WHERE s."threadId" = :thread_id
+        AND s."type" = 'run'
+        ORDER BY s."createdAt" DESC
+        LIMIT 1
+    """)
+
+    async with data_layer.async_session() as session:
+        rows = (await session.execute(sql, {"thread_id": thread_id})).mappings().all()
+        if not rows:
+            return None
+
+        # rows[0] 是最新 step，往后是一路向上的 parent 链
+        for r in rows:
+            print(r.get("name"))
+            print(r.get("step_id"))
+            print(r)
+            print("-----")
+            if _is_run_step(r.get("name")):
+                return r
+
+        return rows[-1]
+    
+async def fetch_childs(data_layer, thread_id: str, parent_step_id: str):
+    sql = text("""
+        SELECT
+            s."id"       AS step_id,
+            s."name"     AS step_name,
+            s."parentId" AS step_parentid,
+            s."input"    AS step_input,
+            s."output"   AS step_output
+        FROM steps s
+        WHERE s."threadId" = :thread_id
+          AND s."parentId" = :parent_step_id
+    """)
+
+    async with data_layer.async_session() as session:
+        result = await session.execute(sql, {"thread_id": thread_id, "parent_step_id": parent_step_id})
+        rows = result.mappings().all()
+        return rows
+
+
+async def get_openai_history(data_layer, thread_id: str, compressed: bool = False, cot_settings: Optional[str] = None) -> List[Dict[str, str]]:
     thread = await data_layer.get_thread(thread_id)
 
     # 1) 全量 flatten（先不排序）

@@ -1,12 +1,13 @@
 import asyncio
 import json
 import chainlit as cl
-from chainlit.context import context  
+from chainlit.context import context
+from chainlit.data import get_data_layer
 
 from config import MCP_TOOL_TIMEOUT
 from llm_stream import stream_and_yield_events, summarize_reasoning, request
 from typing import Any, Mapping, Optional, Dict
-from db_utils import get_openai_history
+from db_utils import get_openai_history, fetch_last_agent_turn, fetch_childs
 
 def _extract_tool_call(step_input_raw: Any) -> tuple[str, dict]:
     """
@@ -31,7 +32,7 @@ def _extract_tool_call(step_input_raw: Any) -> tuple[str, dict]:
     return func_name, args
 
 
-async def ask_user():
+async def ask_user(client):
     print("Asking user to continue...")
     try:
         action = await cl.AskActionMessage(
@@ -42,14 +43,51 @@ async def ask_user():
                         payload={"value": "continue"},
                         label="Continue",
                     ),
+                    cl.Action(
+                        name="retry",
+                        payload={"value": "retry"},
+                        label="Retry",
+                    ),
                 ],
+                timeout=60 * 60 * 24 * 365
             ).send()
         print(f"User action: {action}")
+        if action["name"] == "retry":
+            await regenerate_last_turn(client=client)
     except Exception as e:
         print(f"User action failed: {e}")
         return
 
 
+async def regenerate_last_turn(client):
+    print("Regenerating last turn...")
+    step_row = await fetch_last_agent_turn(get_data_layer(), context.session.thread_id)
+    # find the child steps of this step_row and delete them
+    if not step_row:
+        print("No last agent turn found.")
+        return
+    
+    step_id = str(step_row.get("id"))
+    childs = await fetch_childs(get_data_layer(), context.session.thread_id, step_id)
+    for child in childs:
+        child_step = cl.Step(id=str(child.get("step_id")))
+        await child_step.remove()
+        print(f"Deleted child step {child_step.id} of step {step_id}")
+    
+    parent_step = cl.Step(id=step_id)
+    await parent_step.remove()
+    print(f"Deleted last agent turn step {step_id}")
+    
+    # await run_agent_turn_with_steps_streaming(
+    #     client=client,
+    #     payload={
+    #         "messages": await get_openai_history(get_data_layer(),
+    #             context.session.thread_id),
+    #         "temperature": 0.7,
+    #         "tools": cl.user_session.get("mcp_tools"),
+    #     }
+    # )   
+        
 async def tool_request(query: dict) -> str:
     func_name = query.get("name", "unknown")
     args = query.get("arguments", {})
@@ -135,7 +173,7 @@ async def run_agent_turn_with_steps_streaming(client: Any, payload: Dict[str, An
                     msg.content = ev["content"]
                     await reasoning_step.update()
                     await msg.send()
-                    break
+                    return True
                 
                 reasoning = ev.get("reasoning") or ""
                 if reasoning:
@@ -143,10 +181,10 @@ async def run_agent_turn_with_steps_streaming(client: Any, payload: Dict[str, An
                     reasoning_step.output = reasoning
                     await reasoning_step.update()
                     
-                    summary_plan = await summarize_reasoning(client=client, reasoning=reasoning)
-                    reasoning_step.input = f"{str(summary_plan)}"
-                    print("[INFO] Final summarized plan:", summary_plan)           
-                    await reasoning_step.update()
+                    # summary_plan = await summarize_reasoning(client=client, reasoning=reasoning)
+                    # reasoning_step.input = f"{str(summary_plan)}"
+                    # print("[INFO] Final summarized plan:", summary_plan)           
+                    # await reasoning_step.update()
                 
                 tool_calls = ev.get("tool_calls") or {}
                 if tool_calls:
@@ -157,7 +195,7 @@ async def run_agent_turn_with_steps_streaming(client: Any, payload: Dict[str, An
                             "parent_step_id": turn_step.id,
                         }
                         tool_result = await tool_request(tool_request_payload)
-                        
+    return False    
 
 async def run_agent_turns(client, available_tools, last_message_id):
     rounds = 0
@@ -165,7 +203,7 @@ async def run_agent_turns(client, available_tools, last_message_id):
         while True:
             rounds += 1
 
-            messages = await get_openai_history(context.session.thread_id)
+            messages = await get_openai_history(get_data_layer(), context.session.thread_id)
             # print("messages history:", messages)
             payload = {
                 "messages": messages,
@@ -173,8 +211,9 @@ async def run_agent_turns(client, available_tools, last_message_id):
                 "tools": available_tools,
             }
             print("running agent turn with payload")
-            await ask_user()
-            await run_agent_turn_with_steps_streaming(client, payload)
+            await ask_user(client)
+            if await run_agent_turn_with_steps_streaming(client, payload):
+                break
     except asyncio.CancelledError:
         print(f"[INFO] Agent turns cancelled after {rounds} rounds.")
         raise
@@ -239,9 +278,9 @@ async def run_edit_cot_step(step_row: Mapping[str, Any], client: Any, available_
     # 2) generate new summary plan
     try:
         reasoning = step_row.get("step_output") or ""
-        summary_plan = await summarize_reasoning(client=client, reasoning=reasoning)
-        print("[INFO] Edited summarized plan:", summary_plan)
-        edited_step.input = f"{str(summary_plan)}"
+        # summary_plan = await summarize_reasoning(client=client, reasoning=reasoning)
+        # print("[INFO] Edited summarized plan:", summary_plan)
+        # edited_step.input = f"{str(summary_plan)}"
         edited_step.output = reasoning
     except Exception as e:
         edited_step.output = f"Failed to summarize reasoning: {e}"
@@ -249,7 +288,7 @@ async def run_edit_cot_step(step_row: Mapping[str, Any], client: Any, available_
     await edited_step.update()
 
     # 3) generate tool calls or content
-    messages = await get_openai_history(context.session.thread_id, compressed=True)
+    messages = await get_openai_history(get_data_layer(), context.session.thread_id, compressed=True)
     system_prompt = """You are an agent running inside an interactive app with editable intermediate steps.
 
 IMPORTANT CONTEXT:

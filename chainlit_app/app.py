@@ -1,6 +1,7 @@
 import os
 from typing import Optional
 import chainlit as cl
+from chainlit.data import get_data_layer
 from chainlit.user import User
 from chainlit.types import ThreadDict
 from chainlit import Step  
@@ -115,30 +116,34 @@ async def on_message(message: cl.Message):
                     step_type = meta.get("type", "")
                     if step_id:
                         # 找到对应的 step
-                        step = await fetch_step(thread_id, step_id)
+                        step = await fetch_step(get_data_layer(), thread_id, step_id)
                         print(step.keys())
                         assert step, f"Step {step_id} not found in thread {thread_id}"
                         if step_type == "tool":
                             if step["step_output"] == "":
                                 print("Running edit tool output step...")
-                                # 重新调用工具生成 output之后更新 step
                                 await run_edit_tool_step(step)
                             else:
                                 print(f"Step {step_id} already has output, skipping tool re-execution. With {step['step_input']}")
                         elif step_type == "cot":
                             print("Running edit CoT step...")
-                            await run_edit_cot_step(step, client, tools)
+                            # await run_edit_cot_step(step, client, tools)
                         else:
                             print(f"Unknown step type for edit: {step_type}")
                 else:
                     pass
                     
-            task = asyncio.create_task(run_agent_turns(client, tools, message.id))
-            thread_agent_tasks[thread_id] = task
+            # task = asyncio.create_task(run_agent_turns(client, tools, message.id))
+            thread_agent_tasks[thread_id] = asyncio.current_task()
+            await run_agent_turns(client, tools, message.id)
+            
     except asyncio.CancelledError:
         print(f"[INFO] Agent task for thread {thread_id} was cancelled.")
         await cancel_agent_task(thread_id)
         raise
+    finally:
+        if thread_agent_tasks.get(thread_id) is asyncio.current_task():
+            thread_agent_tasks.pop(thread_id, None)
 
 @cl.on_chat_resume
 async def on_chat_resume(thread: ThreadDict):

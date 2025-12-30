@@ -189,6 +189,13 @@ async def stream_and_yield_events(
             # 把当前快照 yield 出去，调用方可在此决定“开始执行工具”
             yield {"type": "tool_calls_partial", "tool_calls": tool_calls_accumulator}
 
+    if content_acc and not tool_calls_accumulator:
+        # 如果最终没有 tool_calls，则尝试从 content 中恢复
+        recovered = _try_parse_tool_calls_from_content(content_acc)
+        if recovered:
+            tool_calls_accumulator = _normalize_tool_calls(recovered)
+            content_acc = ""  
+
     # streaming 结束
     yield {
         "type": "done",
