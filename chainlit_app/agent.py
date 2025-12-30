@@ -51,9 +51,15 @@ async def ask_user(client):
                 ],
                 timeout=60 * 60 * 24 * 365
             ).send()
+        if not action:
+            print("No user action received, continuing by default.")
+            return
         print(f"User action: {action}")
         if action["name"] == "retry":
             await regenerate_last_turn(client=client)
+    except asyncio.CancelledError:
+        print("[INFO] ask_user cancelled")
+        raise
     except Exception as e:
         print(f"User action failed: {e}")
         return
@@ -169,9 +175,9 @@ async def run_agent_turn_with_steps_streaming(client: Any, payload: Dict[str, An
                 await reasoning_step.stream_token(ev["delta"])
             elif ev["type"] == "done":
                 if ev["content"]:
+                    await reasoning_step.update()
                     msg = cl.Message(content="")
                     msg.content = ev["content"]
-                    await reasoning_step.update()
                     await msg.send()
                     return True
                 
@@ -204,7 +210,12 @@ async def run_agent_turns(client, available_tools, last_message_id):
             rounds += 1
 
             messages = await get_openai_history(get_data_layer(), context.session.thread_id)
-            # print("messages history:", messages)
+            if messages and messages[-1]["role"] == "assistant" and "tool" not in messages[-1]["content"]:
+                # await 
+                print("Last message from assistant without tool calls, ending agent turns.")
+                break
+                
+            print("messages history:", messages)
             payload = {
                 "messages": messages,
                 "temperature": 0.7,

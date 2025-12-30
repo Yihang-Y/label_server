@@ -88,23 +88,24 @@ async def cancel_agent_task(thread_id: str):
     取消并等待该 thread 当前运行的 agent 子任务退出。
     """
     task = thread_agent_tasks.get(thread_id)
-    if task and not task.done():
+    if task and not task.done() and task is not asyncio.current_task():
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+    else:
+        print(f"[INFO] No running agent task for thread {thread_id} to cancel.")
 
 @cl.on_message
 async def on_message(message: cl.Message):
     thread_id = message.thread_id
+    await cancel_agent_task(thread_id)
     lock = thread_locks[thread_id]
     try:
         async with lock:
             tools = cl.user_session.get("mcp_tools") or []
-            
-            await cancel_agent_task(thread_id)
-            
+                    
             meta = getattr(message, "metadata", None) or {}
             edit = (meta.get("edited") if isinstance(meta, dict) else None)
             edit_step = (meta.get("edit_step") if isinstance(meta, dict) else None)
