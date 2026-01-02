@@ -30,13 +30,25 @@ client = ChatModel(
 
 @cl.on_chat_start
 async def start_chat():
-    old_ts = cl.user_session.get("mcp_session")
-    if old_ts:
-        try:
-            await asyncio.shield(old_ts.close())
-        except Exception:
-            pass
-        
+    # Only create new MCP session if one doesn't already exist
+    # This prevents duplicate creation when on_chat_start is called multiple times
+    print(f"Starting chat (thread_id: {cl.context.session.thread_id if cl.context.session else 'None'})")
+    
+    # Check if on_chat_start has already been executed for this session
+    # This prevents duplicate execution when connection_successful is emitted multiple times
+    chat_started = cl.user_session.get("_chat_started")
+    if chat_started:
+        print(f"on_chat_start already executed, skipping")
+        return
+    
+    # Mark as started to prevent duplicate execution
+    cl.user_session.set("_chat_started", True)
+    
+    existing_ts = cl.user_session.get("mcp_session")
+    if existing_ts:
+        # If session already exists, just return (don't create a new one)
+        print(f"MCP session already exists, skipping creation")
+        return
         
     user: Optional[User] = cl.user_session.get("user")
     if not user:
@@ -62,7 +74,7 @@ async def start_chat():
     system_msg = Step(name="System Prompt", type="system_message")
     system_msg.output = SYSTEM_PROMPT
     await system_msg.send()
-
+    
     ts = await connect_mcp_copilot()
     cl.user_session.set("mcp_session", ts)
     cl.user_session.set("mcp_tools", await fetch_mcp_tools(ts))
@@ -87,6 +99,7 @@ async def cancel_agent_task(thread_id: str):
     """
     取消并等待该 thread 当前运行的 agent 子任务退出。
     """
+    print(f"Cancelling agent task for thread {thread_id}")
     task = thread_agent_tasks.get(thread_id)
     if task and not task.done() and task is not asyncio.current_task():
         task.cancel()
@@ -99,6 +112,7 @@ async def cancel_agent_task(thread_id: str):
 
 @cl.on_message
 async def on_message(message: cl.Message):
+    print(f"On message: {message}")
     thread_id = message.thread_id
     await cancel_agent_task(thread_id)
     lock = thread_locks[thread_id]
@@ -133,6 +147,8 @@ async def on_message(message: cl.Message):
                             print(f"Unknown step type for edit: {step_type}")
                 else:
                     pass
+            
+            regenerate_message = message.metadata.get("regenerated")
                     
             # task = asyncio.create_task(run_agent_turns(client, tools, message.id))
             thread_agent_tasks[thread_id] = asyncio.current_task()
@@ -148,6 +164,18 @@ async def on_message(message: cl.Message):
 
 @cl.on_chat_resume
 async def on_chat_resume(thread: ThreadDict):
+    print(f"Resuming chat for thread {thread.get('id')}")
+    
+    # Check if on_chat_resume has already been executed for this session
+    # This prevents duplicate execution when connection_successful is emitted multiple times
+    chat_resumed = cl.user_session.get("_chat_resumed")
+    if chat_resumed:
+        print(f"on_chat_resume already executed, skipping")
+        return
+    
+    # Mark as resumed to prevent duplicate execution
+    cl.user_session.set("_chat_resumed", True)
+    
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
         try:
@@ -158,7 +186,26 @@ async def on_chat_resume(thread: ThreadDict):
     profile = metadata.get("profile") or {}
     if profile:
         cl.user_session.set("profile", profile)
-        
+    
+    # Only create new MCP session if one doesn't already exist
+    # This prevents duplicate creation when on_chat_start and on_chat_resume are both called
+    existing_ts = cl.user_session.get("mcp_session")
+    if existing_ts:
+        # If session already exists, don't create a new one
+        print(f"MCP session already exists, skipping creation")
+        return
+    
+    # Close any old MCP session if exists (shouldn't happen, but just in case)
+    old_ts = cl.user_session.get("mcp_session")
+    if old_ts:
+        try:
+            await asyncio.shield(old_ts.close())
+        except Exception:
+            pass
+        cl.user_session.set("mcp_session", None)
+        cl.user_session.set("mcp_tools", None)
+    
+    # Create new MCP session
     ts = await connect_mcp_copilot()
     cl.user_session.set("mcp_session", ts)
     cl.user_session.set("mcp_tools", await fetch_mcp_tools(ts))

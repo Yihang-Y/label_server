@@ -81,8 +81,34 @@ async def fetch_childs(data_layer, thread_id: str, parent_step_id: str):
         return rows
 
 
-async def get_openai_history(data_layer, thread_id: str, compressed: bool = False, cot_settings: Optional[str] = None) -> List[Dict[str, str]]:
+async def get_openai_history(data_layer, thread_id: str, branch_id: Optional[str] = None, compressed: bool = False, cot_settings: Optional[str] = None) -> List[Dict[str, str]]:
+    import json
+    
+    # Thread may not exist yet if this is called before the first user message is persisted
+    # In Chainlit, threads are created lazily when the first user message is sent
     thread = await data_layer.get_thread(thread_id)
+    if not thread:
+        # Thread not found - this can happen if:
+        # 1. Thread hasn't been created yet (first message not persisted)
+        # 2. Thread was deleted
+        # 3. Thread ID is invalid
+        print(f"Warning: Thread {thread_id} not found in database. This may be normal if called before first message is persisted. Returning empty history.")
+        return []
+    
+    thread_metadata = thread.get("metadata", {})
+    if not thread_metadata:
+        thread_metadata = {}
+    elif isinstance(thread_metadata, str):
+        try:
+            thread_metadata = json.loads(thread_metadata)
+        except:
+            thread_metadata = {}
+    
+    if not isinstance(thread_metadata, dict):
+        thread_metadata = {}
+    
+    # Use current_branch_id from thread metadata if branch_id not provided
+    current_branch_id = branch_id or thread_metadata.get("current_branch_id", "main")
 
     # 1) 全量 flatten（先不排序）
     flat: List[Dict[str, Any]] = []
@@ -104,6 +130,68 @@ async def get_openai_history(data_layer, thread_id: str, compressed: bool = Fals
         [s for s in flat if s.get("createdAt")],
         key=lambda x: x["createdAt"]
     )
+    
+    # Find fork point for current branch (if it's a forked branch)
+    fork_point_step_id = None
+    if current_branch_id != "main":
+        branches = thread_metadata.get("branches", [])
+        for branch_info in branches:
+            if branch_info.get("branch_id") == current_branch_id:
+                fork_point_step_id = branch_info.get("fork_point")
+                break
+    
+    # Filter steps: include fork point and earlier steps (from any branch), 
+    # plus current branch steps after fork point (non-inactive)
+    filtered_steps = []
+    fork_point_reached = False
+    
+    for s in flat_sorted:
+        step_metadata = s.get("metadata", {})
+        if isinstance(step_metadata, str):
+            try:
+                step_metadata = json.loads(step_metadata)
+            except:
+                step_metadata = {}
+        
+        step_branch_id = step_metadata.get("branch_id", "main")
+        step_status = step_metadata.get("branch_status")
+        step_id = s.get("id")
+        
+        # Check if we've reached the fork point
+        if fork_point_step_id and step_id == fork_point_step_id:
+            fork_point_reached = True
+        
+        # Include if:
+        # 1. Before fork point (from any branch, not inactive) OR
+        # 2. After fork point AND belongs to current branch AND not inactive
+        if not fork_point_reached:
+            # Before fork point: include from any branch (not inactive)
+            if step_status != "inactive":
+                filtered_steps.append(s)
+        else:
+            # After fork point: only include from current branch (not inactive)
+            if step_branch_id == current_branch_id and step_status != "inactive":
+                filtered_steps.append(s)
+    
+    # If no fork point found (main branch or branch not in branches list), 
+    # just filter by current branch
+    if not fork_point_reached:
+        filtered_steps = []
+        for s in flat_sorted:
+            step_metadata = s.get("metadata", {})
+            if isinstance(step_metadata, str):
+                try:
+                    step_metadata = json.loads(step_metadata)
+                except:
+                    step_metadata = {}
+            
+            step_branch_id = step_metadata.get("branch_id", "main")
+            step_status = step_metadata.get("branch_status")
+            
+            if step_branch_id == current_branch_id and step_status != "inactive":
+                filtered_steps.append(s)
+    
+    flat_sorted = filtered_steps
 
     # 3) 找到“最后一个 cot step”
     last_cot = None

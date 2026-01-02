@@ -210,10 +210,10 @@ async def run_agent_turns(client, available_tools, last_message_id):
             rounds += 1
 
             messages = await get_openai_history(get_data_layer(), context.session.thread_id)
-            if messages and messages[-1]["role"] == "assistant" and "tool" not in messages[-1]["content"]:
-                # await 
-                print("Last message from assistant without tool calls, ending agent turns.")
-                break
+            # if messages and messages[-1]["role"] == "assistant" and "tool" not in messages[-1]["content"]:
+            #     # await 
+            #     print("Last message from assistant without tool calls, ending agent turns.")
+            #     break
                 
             print("messages history:", messages)
             payload = {
